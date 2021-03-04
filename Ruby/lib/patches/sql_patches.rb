@@ -1,68 +1,74 @@
+# frozen_string_literal: true
+
 class SqlPatches
-
-  def self.patched?
-    @patched
+  def self.correct_version?(required_version, klass)
+    Gem::Dependency.new('', required_version).match?('', klass::VERSION)
+  rescue NameError
+    false
   end
 
-  def self.patched=(val)
-    @patched = val
+  def self.record_sql(statement, parameters = nil, &block)
+    start  = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    result = yield
+    record = ::Rack::MiniProfiler.record_sql(statement, elapsed_time(start), parameters)
+    [result, record]
   end
 
-	def self.class_exists?(name)
-		eval(name + ".class").to_s.eql?('Class')
-	rescue NameError
-		false
-	end
-	
-  def self.module_exists?(name)
-		eval(name + ".class").to_s.eql?('Module')
-	rescue NameError
-		false
-	end
+  def self.should_measure?
+    current = ::Rack::MiniProfiler.current
+    (current && current.measure)
+  end
+
+  def self.elapsed_time(start_time)
+    ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time).to_f * 1000).round(1)
+  end
+
+  def self.patch_rails?
+    ::Rack::MiniProfiler.patch_rails?
+  end
+
+  def self.sql_patches
+    patches = []
+
+    #patches << 'mysql2' if defined?(Mysql2::Client) && Mysql2::Client.class == Class
+    #patches << 'pg' if defined?(PG::Result) && PG::Result.class == Class
+    #patches << 'oracle_enhanced' if defined?(ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter) && ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.class == Class &&
+    #                                SqlPatches.correct_version?('~> 1.5.0', ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter) &&
+    #                                patch_rails?
+    # if the adapters were directly patched, don't patch again
+    #if !patches.empty?
+    #  Rack::MiniProfiler.subscribe_sql_active_record = false
+    #  return patches
+    #end
+    #patches << 'sequel' if defined?(Sequel::Database) && Sequel::Database.class == Class
+    patches << 'activerecord' if defined?(ActiveRecord) && ActiveRecord.class == Module #&& patch_rails?
+    Rack::MiniProfiler.subscribe_sql_active_record = patches.empty? && !patch_rails?
+    patches
+  end
+
+  def self.other_patches
+    patches = []
+    #patches << 'mongo' if defined?(Mongo::Server::Connection) && Mongo.class == Module
+    #patches << 'moped' if defined?(Moped::Node) && Moped::Node.class == Class
+    #patches << 'plucky' if defined?(Plucky::Query) && Plucky::Query.class == Class
+    #patches << 'rsolr' if defined?(RSolr::Connection) && RSolr::Connection.class == Class && RSolr::VERSION[0] != "0"
+    #patches << 'nobrainer' if defined?(NoBrainer) && NoBrainer.class == Module
+    #patches << 'riak' if defined?(Riak) && Riak.class == Module
+    #patches << 'neo4j' if defined?(Neo4j::Core) && Neo4j::Core::Query.class == Class
+    patches
+  end
+
+  def self.all_patch_files
+    env_var = ENV["RACK_MINI_PROFILER_PATCH"]
+    return [] if env_var == "false"
+    env_var ? env_var.split(",").map(&:strip) : sql_patches + other_patches
+  end
+
+  def self.patch(patch_files = all_patch_files)
+    patch_files.each do |patch_file|
+      require "patches/db/#{patch_file}"
+    end
+  end
 end
 
-## based off https://github.com/newrelic/rpm/blob/master/lib/new_relic/agent/instrumentation/active_record.rb
-## fallback for alls sorts of weird dbs
-if SqlPatches.module_exists?('ActiveRecord') && !SqlPatches.patched?
-  module Rack
-    class MiniProfiler  
-      module ActiveRecordInstrumentation
-        def self.included(instrumented_class)
-          instrumented_class.class_eval do
-            unless instrumented_class.method_defined?(:log_without_miniprofiler)
-              alias_method :log_without_miniprofiler, :log
-              alias_method :log, :log_with_miniprofiler
-              protected :log
-            end
-          end
-        end
-
-        def log_with_miniprofiler(*args, &block)
-          current = ::Rack::MiniProfiler.current
-          return log_without_miniprofiler(*args, &block) unless current
-
-          sql, name, binds = args
-          t0 = Time.now
-          rval = log_without_miniprofiler(*args, &block)
-          
-          # Don't log schema queries if the option is set
-          return rval if Rack::MiniProfiler.config.skip_schema_queries and name =~ /SCHEMA/
-
-          elapsed_time = ((Time.now - t0).to_f * 1000).round(1)
-          Rack::MiniProfiler.record_sql(sql, elapsed_time)
-          rval
-        end
-      end
-    end
-
-    def self.insert_instrumentation 
-      ActiveRecord::ConnectionAdapters::AbstractAdapter.module_eval do
-        include ::Rack::MiniProfiler::ActiveRecordInstrumentation
-      end
-    end
-
-    if defined?(::Rails) && !SqlPatches.patched?
-      insert_instrumentation
-    end
-  end
-end
+SqlPatches.patch
